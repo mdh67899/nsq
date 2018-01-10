@@ -16,27 +16,36 @@ import (
 
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
+	//Topic收到并处理完成的msg数量
 	messageCount uint64
 
 	sync.RWMutex
 
+	//topic名字
 	name              string
+	//消费topic数据的channel map集合
 	channelMap        map[string]*Channel
+	//topic数据写到磁盘上的文件队列，实现了Put(),ReadChan(),Close(), Delete(), Depth() ,Empty()等数据结构和方法
 	backend           BackendQueue
+	//内存chan，用来接收topic收到的数据，临时缓冲区
 	memoryMsgChan     chan *Message
+	//topic退出chan
 	exitChan          chan int
 	channelUpdateChan chan int
+	//waitGroup用来保证该topic执行的goroutine最终都能正常结束
 	waitGroup         util.WaitGroupWrapper
 	exitFlag          int32
 	idFactory         *guidFactory
 
 	ephemeral      bool
+	//删除topic后对该topic执行的方法
 	deleteCallback func(*Topic)
 	deleter        sync.Once
 
 	paused    int32
 	pauseChan chan bool
 
+	//存储nsqd数据结构，上下文
 	ctx *context
 }
 
@@ -58,6 +67,7 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		t.ephemeral = true
 		t.backend = newDummyBackendQueue()
 	} else {
+		//传递给文件消息队列的log handler
 		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
 			opts := ctx.nsqd.getOpts()
 			lg.Logf(opts.Logger, opts.logLevel, lg.LogLevel(level), f, args...)
@@ -74,6 +84,7 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		)
 	}
 
+	//对该topic收到的进行后台处理goroutine
 	t.waitGroup.Wrap(func() { t.messagePump() })
 
 	t.ctx.nsqd.Notify(t)
