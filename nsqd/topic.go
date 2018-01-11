@@ -22,30 +22,37 @@ type Topic struct {
 	sync.RWMutex
 
 	//topic名字
-	name              string
+	name string
 	//消费topic数据的channel map集合
-	channelMap        map[string]*Channel
-	//topic数据写到磁盘上的文件队列，实现了Put(),ReadChan(),Close(), Delete(), Depth() ,Empty()等数据结构和方法
-	backend           BackendQueue
+	channelMap map[string]*Channel
+	//topic本身对应的backend磁盘文件队列, 实现了Put(), ReadChan(), Close(), Delete(), Depth() ,Empty()等方法
+	//一般情况下topic收到的数据是放到memoryMsgChan, messagePump()方法会把数据取出放到各个channel的backend中
+	// 但是有可能出现messagePump()方法处理比较慢的情况, 所以Topic也启用backend做个缓冲，不要卡住用户发送msg到topic, 所以nsq实现不了顺序消费, 只能实现最终消费
+	backend BackendQueue
 	//内存chan，用来接收topic收到的数据，临时缓冲区
-	memoryMsgChan     chan *Message
+	memoryMsgChan chan *Message
 	//topic退出chan
-	exitChan          chan int
+	exitChan chan int
+	//如果消费topic数据的channe数量（新增消费channel或者消费channel关闭）发生变化，往这个chan里面发送signal，由messagePump()方法更新channel并且把对应关系持久话到磁盘上
 	channelUpdateChan chan int
-	//waitGroup用来保证该topic执行的goroutine最终都能正常结束
-	waitGroup         util.WaitGroupWrapper
-	exitFlag          int32
-	idFactory         *guidFactory
+	//waitGroup用来保证该topic执行的messagePump() goroutine最终可以正常结束
+	waitGroup util.WaitGroupWrapper
+	//topic close或者exit时的标志位
+	exitFlag  int32
+	idFactory *guidFactory
 
-	ephemeral      bool
+	ephemeral bool
 	//删除topic后对该topic执行的方法
 	deleteCallback func(*Topic)
-	deleter        sync.Once
+	//deleteCallback方法只允许执行一次
+	deleter sync.Once
 
-	paused    int32
+	//暂停topic,
+	paused int32
+	//topic暂停服务的chan
 	pauseChan chan bool
 
-	//存储nsqd数据结构，上下文
+	//存储topic所属的nsqd数据结构，上下文
 	ctx *context
 }
 
@@ -67,11 +74,12 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		t.ephemeral = true
 		t.backend = newDummyBackendQueue()
 	} else {
-		//传递给文件消息队列的log handler
+		//传递给backend的log handler
 		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
 			opts := ctx.nsqd.getOpts()
 			lg.Logf(opts.Logger, opts.logLevel, lg.LogLevel(level), f, args...)
 		}
+		//Topic启用backend, 防止收到的数据过多，messagePump()慢造成memoryMsgChan塞满, 先把消息放入topic自身的backend里面，等待messagePump方法处理到各个channel的backend
 		t.backend = diskqueue.New(
 			topicName,
 			ctx.nsqd.getOpts().DataPath,
@@ -84,9 +92,10 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 		)
 	}
 
-	//对该topic收到的进行后台处理goroutine
+	//对该topic收到的进行后台处理goroutine, 启用waitGroup
 	t.waitGroup.Wrap(func() { t.messagePump() })
 
+	//将Metadata信息持久化的硬盘上
 	t.ctx.nsqd.Notify(t)
 
 	return t
@@ -108,6 +117,7 @@ func (t *Topic) GetChannel(channelName string) *Channel {
 	if isNew {
 		// update messagePump state
 		select {
+		//如果channel是新增的, 持久化一下metaData到硬盘, 放入chan一个数据, 由messagePump()方法处理持久化操作
 		case t.channelUpdateChan <- 1:
 		case <-t.exitChan:
 		}
@@ -116,10 +126,13 @@ func (t *Topic) GetChannel(channelName string) *Channel {
 	return channel
 }
 
+//检查是该channel是否存在, 存在就返回, 没有就创建一个
 // this expects the caller to handle locking
 func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 	channel, ok := t.channelMap[channelName]
 	if !ok {
+		//channel的Callback方法，如果channel关闭, 就执行callback方法从channnelMap中删掉channel和channel相关信息
+		//总感觉怪怪的
 		deleteCallback := func(c *Channel) {
 			t.DeleteExistingChannel(c.name)
 		}
@@ -207,6 +220,7 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 
 func (t *Topic) put(m *Message) error {
 	select {
+	//尝试把msg放入topic的memoryMsgChan, 如果memoryMsgChan满了造成阻塞, 就放入topic的backend文件队列
 	case t.memoryMsgChan <- m:
 	default:
 		b := bufferPoolGet()
@@ -224,6 +238,7 @@ func (t *Topic) put(m *Message) error {
 }
 
 func (t *Topic) Depth() int64 {
+	//Depth返回topic memoryMsgChan缓冲区和backend文件队列堆积的数据，针对的是topic级别
 	return int64(len(t.memoryMsgChan)) + t.backend.Depth()
 }
 
@@ -239,24 +254,30 @@ func (t *Topic) messagePump() {
 
 	t.RLock()
 	for _, c := range t.channelMap {
+		//将消费topic数据的channel放到集合里面
 		chans = append(chans, c)
 	}
 	t.RUnlock()
 
 	if len(chans) > 0 {
+		//如果有channel存在, 就处理topic收到的数据, 否则职位默认值nil, 什么都不处理, 等Topic的memoryMsgChan满了就由put方法放入到文件队列
 		memoryMsgChan = t.memoryMsgChan
 		backendChan = t.backend.ReadChan()
 	}
 
 	for {
 		select {
+		//topic的memoryMsgChan缓冲区收到的msg
 		case msg = <-memoryMsgChan:
+		//topic文件缓冲队列的未处理的msg
 		case buf = <-backendChan:
 			msg, err = decodeMessage(buf)
 			if err != nil {
 				t.ctx.nsqd.logf(LOG_ERROR, "failed to decode message - %s", err)
 				continue
 			}
+		//topic的channel数量发生变化了, chan收到更新请求
+		//更新metaData到硬盘, 并且更新自己的数据来源处理到channel的backend文件队列
 		case <-t.channelUpdateChan:
 			chans = chans[:0]
 			t.RLock()
@@ -272,6 +293,7 @@ func (t *Topic) messagePump() {
 				backendChan = t.backend.ReadChan()
 			}
 			continue
+		//暂停处理, 不再把msg放入到channel中
 		case pause := <-t.pauseChan:
 			if pause || len(chans) == 0 {
 				memoryMsgChan = nil
@@ -324,6 +346,7 @@ func (t *Topic) Close() error {
 }
 
 func (t *Topic) exit(deleted bool) error {
+	//设置exitFlag, 线程级别安全性
 	if !atomic.CompareAndSwapInt32(&t.exitFlag, 0, 1) {
 		return errors.New("exiting")
 	}
@@ -338,11 +361,14 @@ func (t *Topic) exit(deleted bool) error {
 		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing", t.name)
 	}
 
+	//关闭Topic的exitChan, 让Topic中所有的正在进行操作的goroutine结束
+	//停止messagePump()方法, 不再从memoryMsgChan和backend文件队列的msg放到channel的backend队列里
 	close(t.exitChan)
 
 	// synchronize the close of messagePump()
 	t.waitGroup.Wait()
 
+	//如果是删除, 清空Topic的memoryMsgChan和文件队列的数据, 删除Topic的backend文件队列
 	if deleted {
 		t.Lock()
 		for _, channel := range t.channelMap {
@@ -356,6 +382,7 @@ func (t *Topic) exit(deleted bool) error {
 		return t.backend.Delete()
 	}
 
+	//如果是关闭Topic, 把channel Close掉
 	// close all the channels
 	for _, channel := range t.channelMap {
 		err := channel.Close()
@@ -370,6 +397,7 @@ func (t *Topic) exit(deleted bool) error {
 	return t.backend.Close()
 }
 
+//清空Topic的memoryMsgChan数据, 关闭文件队列中的数据处理(但是文件队列的readFile, writeFile, readPos, writePos信息还在)
 func (t *Topic) Empty() error {
 	for {
 		select {
@@ -383,6 +411,7 @@ finish:
 	return t.backend.Empty()
 }
 
+//关闭Topic时将Topic的memoryMsgChan里的数据全部持久化到backend文件队列
 func (t *Topic) flush() error {
 	var msgBuf bytes.Buffer
 
@@ -409,6 +438,7 @@ finish:
 	return nil
 }
 
+//没看懂,,,,,,后期再补充
 func (t *Topic) AggregateChannelE2eProcessingLatency() *quantile.Quantile {
 	var latencyStream *quantile.Quantile
 	t.RLock()
@@ -440,6 +470,8 @@ func (t *Topic) UnPause() error {
 }
 
 func (t *Topic) doPause(pause bool) error {
+	//停止和唤醒队列, 根据传递的值来通知messagePump()方法, 停止就干掉messagePump()方法里读取的memoryMsgChan
+	//和backend文件队列, 不再继续处理Topic收到的数据发送到各个channel的backend队列
 	if pause {
 		atomic.StoreInt32(&t.paused, 1)
 	} else {

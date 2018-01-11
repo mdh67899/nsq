@@ -37,6 +37,7 @@ func NewMessage(id MessageID, body []byte) *Message {
 	}
 }
 
+//把数据编压缩码一下, encoding成二进制写到w里面
 func (m *Message) WriteTo(w io.Writer) (int64, error) {
 	var buf [10]byte
 	var total int64
@@ -75,6 +76,8 @@ func (m *Message) WriteTo(w io.Writer) (int64, error) {
 //                        (uint16)
 //                         2-byte
 //                        attempts
+//消息格式是这样的: 前8个字节是精确到纳秒的时间戳 + 2字节的attmpts + 16字节的message ID + 若干字节的message body
+//消息最短是 8+2+16 = 26字节
 func decodeMessage(b []byte) (*Message, error) {
 	var msg Message
 
@@ -90,6 +93,7 @@ func decodeMessage(b []byte) (*Message, error) {
 	return &msg, nil
 }
 
+//把msg编码一下写道buffer里面, 然后使用Put方法把数据写道backend文件队列里面
 func writeMessageToBackend(buf *bytes.Buffer, msg *Message, bq BackendQueue) error {
 	buf.Reset()
 	_, err := msg.WriteTo(buf)

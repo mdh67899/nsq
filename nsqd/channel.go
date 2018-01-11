@@ -299,6 +299,8 @@ func (c *Channel) PutMessage(m *Message) error {
 	return nil
 }
 
+//Topic的messagePump方法收到数据后会使用Put方法写入到channel中, 实际上执行的也是put方法
+//和Topic中的逻辑一样, 内存缓冲区有空余空间就写入, 没有就写入到channel的backend文件队列
 func (c *Channel) put(m *Message) error {
 	select {
 	case c.memoryMsgChan <- m:
