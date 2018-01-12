@@ -118,6 +118,7 @@ func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 
 		Conn: conn,
 
+		//读缓冲区和写缓冲区
 		Reader: bufio.NewReaderSize(conn, defaultBufferSize),
 		Writer: bufio.NewWriterSize(conn, defaultBufferSize),
 

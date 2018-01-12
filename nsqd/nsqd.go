@@ -216,8 +216,10 @@ func (n *NSQD) Main() {
 	var httpListener net.Listener
 	var httpsListener net.Listener
 
+	//设置上下文
 	ctx := &context{n}
 
+	//nsqd监听tcp端口
 	tcpListener, err := net.Listen("tcp", n.getOpts().TCPAddress)
 	if err != nil {
 		n.logf(LOG_FATAL, "listen (%s) failed - %s", n.getOpts().TCPAddress, err)
@@ -226,8 +228,10 @@ func (n *NSQD) Main() {
 	n.Lock()
 	n.tcpListener = tcpListener
 	n.Unlock()
+	//tcp处理连接的handler
 	tcpServer := &tcpServer{ctx: ctx}
 	n.waitGroup.Wrap(func() {
+		//tcpServer, 从nsqd.tcpListener收到连接, 交给tcpServer的handler方法处理
 		protocol.TCPServer(n.tcpListener, tcpServer, n.logf)
 	})
 
@@ -308,6 +312,7 @@ func writeSyncFile(fn string, data []byte) error {
 	return err
 }
 
+//先从metaData文件把nsq自身的元数据(包括topic, channel等信息)初始化一下
 func (n *NSQD) LoadMetadata() error {
 	atomic.StoreInt32(&n.isLoading, 1)
 	defer atomic.StoreInt32(&n.isLoading, 0)
@@ -369,6 +374,7 @@ func (n *NSQD) LoadMetadata() error {
 	return nil
 }
 
+//持久化一下metaData到本地硬盘
 func (n *NSQD) PersistMetadata() error {
 	// persist metadata about what topics/channels we have, across restarts
 	fileName := newMetadataFile(n.getOpts())
@@ -484,6 +490,8 @@ func (n *NSQD) Exit() {
 	n.dl.Unlock()
 }
 
+//从本地磁盘上的metaData读取到topic信息后, 先创建topic, 再去lookupd进程看一下这个topic有什么channel, 有就顺便也初始化一下
+//等topic初始化完成以后再用metaData信息里的channel二次填充一下, 防止出现channel未创建的情况
 // GetTopic performs a thread safe operation
 // to return a pointer to a Topic object (potentially new)
 func (n *NSQD) GetTopic(topicName string) *Topic {

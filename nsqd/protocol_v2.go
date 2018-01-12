@@ -33,12 +33,14 @@ type protocolV2 struct {
 	ctx *context
 }
 
+//tcpServer收到连接后, 交给IOLoop方法处理
 func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var err error
 	var line []byte
 	var zeroTime time.Time
 
 	clientID := atomic.AddInt64(&p.ctx.nsqd.clientIDSequence, 1)
+	//把client封装成一个结构体
 	client := newClientV2(clientID, conn, p.ctx)
 
 	// synchronize the startup of messagePump in order
@@ -59,6 +61,8 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 
 		// ReadSlice does not allocate new space for the data each request
 		// ie. the returned slice is only valid until the next call to it
+		// messagePump()方法从net.conn中读取数据, 写到client.Reader这个bufio.Reader
+		// 将client.Reader中读取并判断操作方法和操作参数, 在tcp连接中默认是以换行符做分隔符, 并且bufio.Reader读到某个位置可以把读指针移动到该位置
 		line, err = client.Reader.ReadSlice('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -69,6 +73,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 			break
 		}
 
+		// line: bytes("SUB TopicName\n"), 包含method和参数, 以换行符号做结尾, 需要删掉换行符并且将方法和参数拆分开
 		// trim the '\n'
 		line = line[:len(line)-1]
 		// optionally trim the '\r'
@@ -80,6 +85,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
 
 		var response []byte
+		//Exec方法会判断params结构里的method, 按照参数处理
 		response, err = p.Exec(client, params)
 		if err != nil {
 			ctx := ""
@@ -101,6 +107,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 			continue
 		}
 
+		// 如果Exec方法处理得到的结果不为nil, 就把结果返回给net.conn
 		if response != nil {
 			err = p.Send(client, frameTypeResponse, response)
 			if err != nil {
@@ -138,6 +145,7 @@ func (p *protocolV2) SendMessage(client *clientV2, msg *Message, buf *bytes.Buff
 }
 
 func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error {
+	// 加写锁
 	client.writeLock.Lock()
 
 	var zeroTime time.Time
@@ -270,6 +278,8 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			flushed = true
 		case <-client.ReadyStateChan:
 		case subChannel = <-subEventChan:
+			//当client SUB操作某些channel时, SUB方法会往client.SubEventChan发送一下channel信息,
+			//此时需要准备好channel, 并拒绝用户再次SUB某个channel
 			// you can't SUB anymore
 			subEventChan = nil
 		case identifyData := <-identifyEventChan:
@@ -624,6 +634,7 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 		break
 	}
 	atomic.StoreInt32(&client.State, stateSubscribed)
+	//client执行了SUB操作, 去nsqd上下文的topicMap中找到topic对应的channl, 放入到client的channel中, 由messagePump()方法进行数据推送到client
 	client.Channel = channel
 	// update message pump
 	client.SubEventChan <- channel
@@ -663,6 +674,7 @@ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 			fmt.Sprintf("RDY count %d out of range 0-%d", count, p.ctx.nsqd.getOpts().MaxRdyCount))
 	}
 
+	//当client需要接收channel储存的msg时, 需要使用RDY count操作, 让client明白自己有需求, 使messagePump方法开始准备发送数据
 	client.SetReadyCount(count)
 
 	return nil, nil
@@ -755,9 +767,14 @@ func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+// http://nsq.io/clients/tcp_protocol_spec.html
+// Publish a message to a topic:
+// PUB <topic_name>\n
+// [ 4-byte size in bytes ][ N-byte binary data ]
 func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
+	//params [][]byte("PUB"), byte("TopicName")
 	if len(params) < 2 {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "PUB insufficient number of parameters")
 	}
