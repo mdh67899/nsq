@@ -237,6 +237,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	close(startedChan)
 
 	for {
+		//检查当前是否订阅了有效的channel, 并判断用户是否发送RDY执行准备接收msg, 是的话就初始化好msgChan和backendMsgChan
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
 			memoryMsgChan = nil
@@ -278,8 +279,8 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			flushed = true
 		case <-client.ReadyStateChan:
 		case subChannel = <-subEventChan:
-			//当client SUB操作某些channel时, SUB方法会往client.SubEventChan发送一下channel信息,
-			//此时需要准备好channel, 并拒绝用户再次SUB某个channel
+			//当client SUB操作某些channel时, SUB方法会往client.SubEventChan发送一下channel信息, 订阅的channel记录好
+			//已经订阅好channel之后就关掉chan, 拒绝用户再次SUB某个channel
 			// you can't SUB anymore
 			subEventChan = nil
 		case identifyData := <-identifyEventChan:
@@ -642,6 +643,8 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	return okBytes, nil
 }
 
+//RDY方法需要客户端先执行SUB方法确定好自己订阅的topic和channel, 使用RDY来确定接收的数量, 此处之后再client上的
+//增加数量, messagePump方法会主动往客户端发送数据, 客户端收到数据之后需要使用FIN确认消息收到
 func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 

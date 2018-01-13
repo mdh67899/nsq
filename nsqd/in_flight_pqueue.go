@@ -13,6 +13,7 @@ func (pq inFlightPqueue) Swap(i, j int) {
 }
 
 func (pq *inFlightPqueue) Push(x *Message) {
+	//push的时候把mseeage加到尾部, 并设置Messgae在Queue里面的index, 方便按照index删除
 	n := len(*pq)
 	c := cap(*pq)
 	if n+1 > c {

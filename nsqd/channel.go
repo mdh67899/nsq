@@ -65,6 +65,7 @@ type Channel struct {
 	deferredMessages map[MessageID]*pqueue.Item
 	deferredPQ       pqueue.PriorityQueue
 	deferredMutex    sync.Mutex
+	//当往client发送从memoryMsgChan获取消息时, 需要把msgID写到inFlightMessages map里面以及inFlightPQ里面, 等用户发送FIN确认收到以后再从这个map和PQ里面干掉
 	inFlightMessages map[MessageID]*Message
 	inFlightPQ       inFlightPqueue
 	inFlightMutex    sync.Mutex
@@ -348,6 +349,7 @@ func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout ti
 }
 
 // FinishMessage successfully discards an in-flight message
+//当用户收到消息回复FIN时, 把队列里面的正在发送中的消息干掉
 func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
@@ -419,6 +421,7 @@ func (c *Channel) RemoveClient(clientID int64) {
 }
 
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
+	//这个消息是需要往client发送的msg, 需要加入到发送队列里面并在堆里设置优先级
 	now := time.Now()
 	msg.clientID = clientID
 	msg.deliveryTS = now

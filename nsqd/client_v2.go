@@ -340,6 +340,7 @@ func (c *clientV2) Empty() {
 }
 
 func (c *clientV2) SendingMessage() {
+	//准备发送msg的时候需要在发送中的计数器加1
 	atomic.AddInt64(&c.InFlightCount, 1)
 	atomic.AddUint64(&c.MessageCount, 1)
 }
