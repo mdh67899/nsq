@@ -262,8 +262,13 @@ func (n *NSQD) Main() {
 		http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf)
 	})
 
+	//channel中正在发送但尚未得到客户端确认的数据以及延迟发送的数据会写到channel级别的
+	//processInFlightQueue， processDeferredQueue两个数据结构中， 需要开一个worker确保可以及时将未收到回复的数据
+	//以及延迟发送的数据及时重试和发送， 此出启动一个worker去不断的检查
 	n.waitGroup.Wrap(func() { n.queueScanLoop() })
+	//保持和lookup服务的连接， 定时同步信息
 	n.waitGroup.Wrap(func() { n.lookupLoop() })
+	//如果有Statsd地址的配置， 就定时把nsqd的状态发送个Statsd
 	if n.getOpts().StatsdAddress != "" {
 		n.waitGroup.Wrap(func() { n.statsdLoop() })
 	}
@@ -696,14 +701,18 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 // If QueueScanDirtyPercent (default: 25%) of the selected channels were dirty,
 // the loop continues without sleep.
 func (n *NSQD) queueScanLoop() {
+	//worker的计时器， 如果时间到期就处理queue里面的数据
 	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
+	//worker处理数据完成之后将结果返回给这个chan
 	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount)
+	//退出chan, 如果nsqd退出， 就关闭这个chan， worker收到关闭信息会结束loop
 	closeCh := make(chan int)
 
 	workTicker := time.NewTicker(n.getOpts().QueueScanInterval)
 	refreshTicker := time.NewTicker(n.getOpts().QueueScanRefreshInterval)
 
 	channels := n.channels()
+	//对worker的数据进行重新分配， 多则退出少则新增
 	n.resizePool(len(channels), workCh, responseCh, closeCh)
 
 	for {
@@ -726,6 +735,7 @@ func (n *NSQD) queueScanLoop() {
 		}
 
 	loop:
+		//随机找出几个channel发送给workerChan， 让worker去处理
 		for _, i := range util.UniqRands(num, len(channels)) {
 			workCh <- channels[i]
 		}
